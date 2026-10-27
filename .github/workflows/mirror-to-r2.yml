@@ -49,6 +49,10 @@ jobs:
           gh release download "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --dir files \
             --pattern '*.zip' --pattern '*.dmg' --pattern '*.exe' --pattern '*.msi' --pattern '*.AppImage' --pattern '*.deb'
           ls -la files
+          if [ -z "$(ls -A files)" ]; then
+            echo "::error::This release has no app files attached (only GitHub's automatic source code). Attach the built .zip or .dmg and run this again."
+            exit 1
+          fi
 
       - name: Upload files to R2 and build latest.json
         run: |
@@ -57,11 +61,12 @@ jobs:
           for f in files/*; do
             name=$(basename "$f")
             lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+            # Which platform is this file for? Anything .zip/.dmg that doesn't say win or linux is the Mac build.
             case "$lower" in
-              *.dmg|*mac*.zip|*darwin*.zip) platform=mac ;;
-              *.exe|*.msi|*win*.zip) platform=windows ;;
+              *.exe|*.msi|*win*.zip|*windows*) platform=windows ;;
               *.appimage|*.deb|*linux*) platform=linux ;;
-              *) echo "Skipping $name (unknown platform)"; continue ;;
+              *.dmg|*.zip) platform=mac ;;
+              *) echo "Skipping $name (not an app file)"; continue ;;
             esac
             case "$lower" in
               *.zip) type=application/zip ;;
@@ -78,6 +83,10 @@ jobs:
               FILES=$(echo "$FILES" | jq --arg p "$platform" --arg n "$name" --argjson s "$size" '.[$p] = {name: $n, size: $s}')
             fi
           done
+          if [ "$(echo "$FILES" | jq 'length')" = "0" ]; then
+            echo "::error::No app files were copied. The release needs a .zip, .dmg, .exe, .msi, .AppImage or .deb attached. Files found: $(ls files | tr '\n' ' ')"
+            exit 1
+          fi
           jq --arg product "$PRODUCT" --argjson files "$FILES" \
             '{product: $product, tag: .tagName, name: .name, published_at: .publishedAt, files: $files}' release.json > latest.json
           cat latest.json
@@ -86,10 +95,6 @@ jobs:
         run: |
           if [ "$(jq -r '.isPrerelease or .isDraft' release.json)" = "true" ]; then
             echo "Pre-release or draft: files copied, but the site keeps serving the current version."
-            exit 0
-          fi
-          if [ "$(jq '.files | length' latest.json)" = "0" ]; then
-            echo "No app files found in this release; leaving the current download unchanged."
             exit 0
           fi
           npx --yes wrangler@4 r2 object put "$BUCKET/$PRODUCT/latest.json" --file latest.json --content-type application/json --remote
