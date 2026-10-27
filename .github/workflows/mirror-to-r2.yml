@@ -1,0 +1,96 @@
+# Copy every published aProject release to Cloudflare R2, so his-studio.com can serve it fast.
+#
+# Lives in the aPA-releases repo at:  .github/workflows/mirror-to-r2.yml
+# Needs two repository secrets (Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   a Cloudflare API token with "Workers R2 Storage: Edit"
+#   CLOUDFLARE_ACCOUNT_ID  your Cloudflare account id
+#
+# Runs by itself when you publish a release. You can also run it by hand from the Actions tab
+# (useful for copying a release that already exists, like v1.2.0).
+
+name: Mirror release to Cloudflare R2
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to copy (leave empty for the latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      BUCKET: hisstudio-downloads
+      PRODUCT: aproject
+    steps:
+      - name: Work out which release
+        id: rel
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName); fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,name,publishedAt,isPrerelease,isDraft,assets > release.json
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Copying release $TAG"
+          jq -r '.assets[].name' release.json
+
+      - name: Download the release files
+        run: |
+          mkdir -p files
+          gh release download "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --dir files \
+            --pattern '*.zip' --pattern '*.dmg' --pattern '*.exe' --pattern '*.msi' --pattern '*.AppImage' --pattern '*.deb'
+          ls -la files
+
+      - name: Upload files to R2 and build latest.json
+        run: |
+          TAG="${{ steps.rel.outputs.tag }}"
+          FILES='{}'
+          for f in files/*; do
+            name=$(basename "$f")
+            lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+            case "$lower" in
+              *.dmg|*mac*.zip|*darwin*.zip) platform=mac ;;
+              *.exe|*.msi|*win*.zip) platform=windows ;;
+              *.appimage|*.deb|*linux*) platform=linux ;;
+              *) echo "Skipping $name (unknown platform)"; continue ;;
+            esac
+            case "$lower" in
+              *.zip) type=application/zip ;;
+              *.dmg) type=application/x-apple-diskimage ;;
+              *.exe|*.msi) type=application/octet-stream ;;
+              *) type=application/octet-stream ;;
+            esac
+            size=$(stat -c %s "$f")
+            echo "Uploading $name → $platform ($size bytes)"
+            npx --yes wrangler@4 r2 object put "$BUCKET/$PRODUCT/$TAG/$name" --file "$f" --content-type "$type" --remote
+            # Prefer a .dmg over a .zip for Mac when a release has both.
+            current=$(echo "$FILES" | jq -r --arg p "$platform" '.[$p].name // ""')
+            if [ -z "$current" ] || [[ "$lower" == *.dmg ]]; then
+              FILES=$(echo "$FILES" | jq --arg p "$platform" --arg n "$name" --argjson s "$size" '.[$p] = {name: $n, size: $s}')
+            fi
+          done
+          jq --arg product "$PRODUCT" --argjson files "$FILES" \
+            '{product: $product, tag: .tagName, name: .name, published_at: .publishedAt, files: $files}' release.json > latest.json
+          cat latest.json
+
+      - name: Make it the current download
+        run: |
+          if [ "$(jq -r '.isPrerelease or .isDraft' release.json)" = "true" ]; then
+            echo "Pre-release or draft: files copied, but the site keeps serving the current version."
+            exit 0
+          fi
+          if [ "$(jq '.files | length' latest.json)" = "0" ]; then
+            echo "No app files found in this release; leaving the current download unchanged."
+            exit 0
+          fi
+          npx --yes wrangler@4 r2 object put "$BUCKET/$PRODUCT/latest.json" --file latest.json --content-type application/json --remote
+          echo "his-studio.com/download/$PRODUCT now serves ${{ steps.rel.outputs.tag }}"
